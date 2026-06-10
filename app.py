@@ -11,7 +11,6 @@ from PIL import Image, ImageChops, ImageOps, ImageStat, UnidentifiedImageError
 
 BASE_DIR = Path(__file__).resolve().parent
 FRAMES_DIR = BASE_DIR / "frames"
-DEFAULT_OUTPUT_DIR_NAME = "output"
 SUPPORTED_UPLOAD_TYPES = ["jpg", "jpeg", "png", "webp"]
 
 try:
@@ -29,30 +28,12 @@ def sanitize_filename(name: str) -> str:
     return name or "image"
 
 
-def sanitize_folder_name(folder_name: str) -> str:
-    folder_name = folder_name.strip().replace("\\", "/").split("/")[-1]
-    folder_name = folder_name.strip(". ")
-    folder_name = re.sub(r"[^\w.\- ]+", "_", folder_name, flags=re.UNICODE).strip()
-    return folder_name or DEFAULT_OUTPUT_DIR_NAME
-
-
-def ensure_output_folder(folder_name: str) -> Tuple[Optional[Path], str, Optional[str]]:
-    safe_name = sanitize_folder_name(folder_name)
-    output_dir = BASE_DIR / safe_name
-
-    try:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        return output_dir, safe_name, None
-    except OSError as exc:
-        return None, safe_name, str(exc)
-
-
 def load_frames(frames_dir: Path = FRAMES_DIR) -> Tuple[List[Path], Optional[str]]:
     if not frames_dir.exists():
-        return [], "frames/ folder missing."
+        return [], "frames/ folder missing. Add your PNG frames inside the frames folder."
 
     if not frames_dir.is_dir():
-        return [], "frames is not a folder."
+        return [], "frames exists, but it is not a folder."
 
     frames = sorted(frames_dir.glob("*.png"))
 
@@ -693,13 +674,13 @@ def rgba_to_rgb(
     return background
 
 
-def save_output_image(
+def save_output_image_to_bytes(
     image: Image.Image,
-    output_path: Path,
     output_format: str,
     jpg_quality: int,
     icc_profile: Optional[bytes],
-) -> None:
+) -> bytes:
+    buffer = BytesIO()
     save_kwargs: Dict[str, object] = {}
 
     if icc_profile:
@@ -707,7 +688,7 @@ def save_output_image(
 
     if output_format.upper() == "PNG":
         image.save(
-            output_path,
+            buffer,
             format="PNG",
             compress_level=1,
             optimize=False,
@@ -716,7 +697,7 @@ def save_output_image(
     else:
         rgb_image = rgba_to_rgb(image)
         rgb_image.save(
-            output_path,
+            buffer,
             format="JPEG",
             quality=int(jpg_quality),
             subsampling=0,
@@ -724,14 +705,16 @@ def save_output_image(
             **save_kwargs,
         )
 
+    buffer.seek(0)
+    return buffer.getvalue()
 
-def make_unique_output_path(
-    output_dir: Path,
+
+def make_unique_output_name(
     original_filename: str,
     frame_filename: str,
     output_format: str,
     used_names: set,
-) -> Path:
+) -> str:
     original_stem = sanitize_filename(Path(original_filename).stem)
     frame_stem = sanitize_filename(Path(frame_filename).stem)
 
@@ -741,13 +724,12 @@ def make_unique_output_path(
     candidate = f"{base_name}.{extension}"
     counter = 1
 
-    while candidate.lower() in used_names or (output_dir / candidate).exists():
+    while candidate.lower() in used_names:
         candidate = f"{base_name}_{counter}.{extension}"
         counter += 1
 
     used_names.add(candidate.lower())
-
-    return output_dir / candidate
+    return candidate
 
 
 def open_student_image(uploaded_file) -> Tuple[Optional[Image.Image], Optional[bytes], Optional[str]]:
@@ -775,16 +757,15 @@ def make_preview_bytes(image: Image.Image, max_size: Tuple[int, int] = (650, 650
     return buffer.getvalue()
 
 
-def create_zip(file_paths: List[Path]) -> BytesIO:
+def create_zip_from_results(results: List[Dict[str, object]]) -> bytes:
     zip_buffer = BytesIO()
 
     with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-        for file_path in file_paths:
-            if file_path.exists():
-                zip_file.write(file_path, arcname=file_path.name)
+        for result in results:
+            zip_file.writestr(result["filename"], result["file_bytes"])
 
     zip_buffer.seek(0)
-    return zip_buffer
+    return zip_buffer.getvalue()
 
 
 def get_mime_type(output_format: str) -> str:
@@ -798,16 +779,14 @@ def process_uploaded_files(
     frame: Image.Image,
     photo_area_bbox: Tuple[int, int, int, int],
     selected_frame_path: Path,
-    output_dir: Path,
     output_format: str,
     jpg_quality: int,
 ) -> Tuple[List[Dict[str, object]], List[str], bytes]:
     results: List[Dict[str, object]] = []
     messages: List[str] = []
-    generated_paths: List[Path] = []
 
     frame_size = frame.size
-    used_names = {p.name.lower() for p in output_dir.iterdir() if p.is_file()}
+    used_names = set()
     mime_type = get_mime_type(output_format)
 
     progress = st.progress(0)
@@ -843,30 +822,23 @@ def process_uploaded_files(
 
         final_image = apply_frame(student_background, frame)
 
-        output_path = make_unique_output_path(
-            output_dir=output_dir,
+        output_name = make_unique_output_name(
             original_filename=uploaded_file.name,
             frame_filename=selected_frame_path.name,
             output_format=output_format,
             used_names=used_names,
         )
 
-        save_output_image(
+        file_bytes = save_output_image_to_bytes(
             image=final_image,
-            output_path=output_path,
             output_format=output_format,
             jpg_quality=jpg_quality,
             icc_profile=icc_profile,
         )
 
-        generated_paths.append(output_path)
-
-        file_bytes = output_path.read_bytes()
-
         results.append(
             {
-                "filename": output_path.name,
-                "path": output_path,
+                "filename": output_name,
                 "preview_bytes": make_preview_bytes(final_image),
                 "file_bytes": file_bytes,
                 "mime": mime_type,
@@ -877,7 +849,8 @@ def process_uploaded_files(
         progress.progress(index / len(uploaded_files))
 
     progress.empty()
-    zip_bytes = create_zip(generated_paths).getvalue()
+
+    zip_bytes = create_zip_from_results(results)
 
     return results, messages, zip_bytes
 
@@ -930,14 +903,6 @@ def main() -> None:
         if output_format == "JPG":
             jpg_quality = st.slider("JPG Quality", 90, 100, 95)
 
-        output_folder_name = st.text_input("Output folder", DEFAULT_OUTPUT_DIR_NAME)
-
-    output_dir, safe_folder_name, output_error = ensure_output_folder(output_folder_name)
-
-    if output_error or output_dir is None:
-        st.error(f"Output folder error: {output_error}")
-        st.stop()
-
     frames, frame_error = load_frames(FRAMES_DIR)
 
     if frame_error:
@@ -976,7 +941,7 @@ def main() -> None:
             st.success("Frame opening detected and fixed")
 
         generate = st.button(
-            "Generate ZIP",
+            "Generate",
             type="primary",
             disabled=not uploaded_files,
             use_container_width=True,
@@ -988,7 +953,6 @@ def main() -> None:
             frame=frame_image,
             photo_area_bbox=photo_area_bbox,
             selected_frame_path=selected_frame_path,
-            output_dir=output_dir,
             output_format=output_format,
             jpg_quality=jpg_quality,
         )
@@ -996,7 +960,7 @@ def main() -> None:
         st.session_state["results"] = results
         st.session_state["messages"] = messages
         st.session_state["zip_bytes"] = zip_bytes
-        st.session_state["zip_filename"] = f"{safe_folder_name}_graduation_frames.zip"
+        st.session_state["zip_filename"] = "graduation_frames.zip"
 
         if results:
             st.success(f"Generated {len(results)} image(s)")
