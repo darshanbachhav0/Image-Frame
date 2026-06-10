@@ -929,7 +929,7 @@ def main() -> None:
 
     with col2:
         uploaded_files = st.file_uploader(
-            "Student photos",
+            "Sube tu fotos",
             type=SUPPORTED_UPLOAD_TYPES,
             accept_multiple_files=True,
         )
