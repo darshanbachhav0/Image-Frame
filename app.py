@@ -1,6 +1,8 @@
+import os
 import re
 import zipfile
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -13,14 +15,20 @@ BASE_DIR = Path(__file__).resolve().parent
 FRAMES_DIR = BASE_DIR / "frames"
 SUPPORTED_UPLOAD_TYPES = ["jpg", "jpeg", "png", "webp"]
 
+DETECTION_MAX_SIZE = 850
+PREVIEW_MAX_SIZE = (420, 420)
+
 try:
     RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
-    RESAMPLE_BICUBIC = Image.Resampling.BICUBIC
+    RESAMPLE_NEAREST = Image.Resampling.NEAREST
 except AttributeError:
     RESAMPLE_LANCZOS = Image.LANCZOS
-    RESAMPLE_BICUBIC = Image.BICUBIC
+    RESAMPLE_NEAREST = Image.NEAREST
 
 
+# ------------------------------------------------------------
+# Basic helpers
+# ------------------------------------------------------------
 def sanitize_filename(name: str) -> str:
     name = Path(name).name
     name = re.sub(r"[^\w.\- ]+", "_", name, flags=re.UNICODE).strip()
@@ -30,7 +38,7 @@ def sanitize_filename(name: str) -> str:
 
 def load_frames(frames_dir: Path = FRAMES_DIR) -> Tuple[List[Path], Optional[str]]:
     if not frames_dir.exists():
-        return [], "frames/ folder missing. Add your PNG frames inside the frames folder."
+        return [], "frames/ folder missing. Add PNG frames inside the frames folder."
 
     if not frames_dir.is_dir():
         return [], "frames exists, but it is not a folder."
@@ -53,128 +61,86 @@ def image_has_transparency(image: Image.Image) -> bool:
     return alpha_min < 255 and alpha_max > 0
 
 
-def is_light_neutral_pixel(r: int, g: int, b: int, tolerance: int) -> bool:
-    max_channel = max(r, g, b)
-    min_channel = min(r, g, b)
-    return max_channel >= 145 and max_channel - min_channel <= tolerance
+def image_to_png_bytes(image: Image.Image) -> bytes:
+    buffer = BytesIO()
+    image.save(buffer, format="PNG", compress_level=1, optimize=False)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
-def is_close_color(
-    r: int,
-    g: int,
-    b: int,
-    target: Tuple[int, int, int],
-    tolerance: int,
-) -> bool:
-    tr, tg, tb = target
-    return (
-        abs(r - tr) <= tolerance
-        and abs(g - tg) <= tolerance
-        and abs(b - tb) <= tolerance
-    )
+def png_bytes_to_image(data: bytes) -> Image.Image:
+    img = Image.open(BytesIO(data))
+    img.load()
+    return img.convert("RGBA")
 
 
-def detect_fake_center_background(frame: Image.Image) -> bool:
-    img = frame.convert("RGBA")
-    width, height = img.size
+def resize_for_detection(image: Image.Image) -> Tuple[Image.Image, float, float]:
+    width, height = image.size
+    largest = max(width, height)
 
-    crop_w = max(20, width // 5)
-    crop_h = max(20, height // 5)
+    if largest <= DETECTION_MAX_SIZE:
+        return image.copy(), 1.0, 1.0
 
-    left = (width - crop_w) // 2
-    top = (height - crop_h) // 2
+    scale = DETECTION_MAX_SIZE / largest
+    new_w = max(1, int(width * scale))
+    new_h = max(1, int(height * scale))
 
-    center_crop = img.crop((left, top, left + crop_w, top + crop_h))
+    resized = image.resize((new_w, new_h), RESAMPLE_LANCZOS)
 
-    alpha = center_crop.getchannel("A")
-    alpha_min, _ = alpha.getextrema()
+    scale_x = width / new_w
+    scale_y = height / new_h
 
-    if alpha_min < 80:
-        return False
-
-    rgb_crop = center_crop.convert("RGB")
-    stat = ImageStat.Stat(rgb_crop)
-
-    mean_r, mean_g, mean_b = stat.mean
-    std_r, std_g, std_b = stat.stddev
-
-    mean_max = max(mean_r, mean_g, mean_b)
-    mean_min = min(mean_r, mean_g, mean_b)
-
-    is_light = mean_max >= 150
-    is_neutral = mean_max - mean_min <= 50
-    has_variation = max(std_r, std_g, std_b) >= 3
-
-    return is_light and is_neutral and has_variation
+    return resized, scale_x, scale_y
 
 
-def auto_make_checkerboard_transparent(frame: Image.Image) -> Tuple[Image.Image, bool]:
-    img = frame.convert("RGBA")
+def scale_bbox_to_original(
+    bbox: Tuple[int, int, int, int],
+    scale_x: float,
+    scale_y: float,
+    original_size: Tuple[int, int],
+) -> Tuple[int, int, int, int]:
+    left, top, right, bottom = bbox
+    width, height = original_size
 
-    if image_has_transparency(img) and not detect_fake_center_background(img):
-        return img, False
+    left = max(0, int(left * scale_x))
+    top = max(0, int(top * scale_y))
+    right = min(width, int(right * scale_x))
+    bottom = min(height, int(bottom * scale_y))
 
-    width, height = img.size
-    pixels = img.load()
-    tolerance = 55
+    return left, top, right, bottom
 
-    seed_points = [
-        (width // 2, height // 2),
-        (width // 2, height // 3),
-        (width // 2, (height * 2) // 3),
-        (width // 3, height // 2),
-        ((width * 2) // 3, height // 2),
-    ]
 
-    seed_colors: List[Tuple[int, int, int]] = []
+# ------------------------------------------------------------
+# Fast frame opening detection
+# ------------------------------------------------------------
+def create_transparent_opening_mask(frame: Image.Image) -> Image.Image:
+    alpha = frame.convert("RGBA").getchannel("A")
+    return alpha.point(lambda a: 255 if a <= 35 else 0)
 
-    for sx, sy in seed_points:
-        r, g, b, a = pixels[sx, sy]
-        if a > 0 and is_light_neutral_pixel(r, g, b, tolerance):
-            seed_colors.append((r, g, b))
 
-    if not seed_colors:
-        return img, False
+def create_dark_opening_mask(frame: Image.Image) -> Image.Image:
+    rgba = frame.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    lum = rgba.convert("L")
 
-    def is_background_pixel(x: int, y: int) -> bool:
-        r, g, b, a = pixels[x, y]
+    dark = lum.point(lambda p: 255 if p <= 65 else 0)
+    visible = alpha.point(lambda a: 255 if a > 20 else 0)
 
-        if a == 0:
-            return True
+    return ImageChops.multiply(dark, visible)
 
-        if not is_light_neutral_pixel(r, g, b, tolerance):
-            return False
 
-        return any(is_close_color(r, g, b, color, tolerance) for color in seed_colors)
+def create_light_opening_mask(frame: Image.Image) -> Image.Image:
+    rgba = frame.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    hsv = rgba.convert("RGB").convert("HSV")
 
-    visited = bytearray(width * height)
-    queue = deque()
+    h, s, v = hsv.split()
 
-    for sx, sy in seed_points:
-        idx = sy * width + sx
-        visited[idx] = 1
-        queue.append((sx, sy))
+    low_saturation = s.point(lambda p: 255 if p <= 55 else 0)
+    bright = v.point(lambda p: 255 if p >= 145 else 0)
+    visible = alpha.point(lambda a: 255 if a > 20 else 0)
 
-    changed_pixels = 0
-
-    while queue:
-        x, y = queue.popleft()
-
-        if not is_background_pixel(x, y):
-            continue
-
-        r, g, b, _ = pixels[x, y]
-        pixels[x, y] = (r, g, b, 0)
-        changed_pixels += 1
-
-        for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
-            if 0 <= nx < width and 0 <= ny < height:
-                idx = ny * width + nx
-                if not visited[idx]:
-                    visited[idx] = 1
-                    queue.append((nx, ny))
-
-    return img, (changed_pixels / float(width * height)) > 0.005
+    return ImageChops.multiply(ImageChops.multiply(low_saturation, bright), visible)
 
 
 def flood_region_from_center_seeds(
@@ -200,9 +166,8 @@ def flood_region_from_center_seeds(
     for sx, sy in seed_points:
         if 0 <= sx < width and 0 <= sy < height and pixels[sx, sy] > 0:
             idx = sy * width + sx
-            if not visited[idx]:
-                visited[idx] = 1
-                queue.append((sx, sy))
+            visited[idx] = 1
+            queue.append((sx, sy))
 
     if not queue:
         return None, None, 0
@@ -233,8 +198,10 @@ def flood_region_from_center_seeds(
         for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
             if 0 <= nx < width and 0 <= ny < height:
                 idx = ny * width + nx
+
                 if not visited[idx]:
                     visited[idx] = 1
+
                     if pixels[nx, ny] > 0:
                         queue.append((nx, ny))
 
@@ -246,7 +213,7 @@ def flood_region_from_center_seeds(
 
 def find_best_opening_region(
     mask: Image.Image,
-    min_area_ratio: float = 0.02,
+    min_area_ratio: float = 0.015,
 ) -> Tuple[Optional[Image.Image], Optional[Tuple[int, int, int, int]]]:
     mask = mask.convert("L")
     width, height = mask.size
@@ -257,124 +224,7 @@ def find_best_opening_region(
         if count >= width * height * min_area_ratio:
             return region, bbox
 
-    pixels = mask.load()
-    visited = bytearray(width * height)
-
-    best_score = 0.0
-    best_bbox = None
-    best_region = None
-
-    center_x = width / 2
-    center_y = height / 2
-
-    for y in range(height):
-        for x in range(width):
-            idx = y * width + x
-
-            if visited[idx]:
-                continue
-
-            visited[idx] = 1
-
-            if pixels[x, y] == 0:
-                continue
-
-            queue = deque([(x, y)])
-            points: List[int] = []
-
-            min_x = max_x = x
-            min_y = max_y = y
-            touches_border = False
-
-            while queue:
-                cx, cy = queue.popleft()
-
-                if pixels[cx, cy] == 0:
-                    continue
-
-                pidx = cy * width + cx
-                points.append(pidx)
-
-                if cx == 0 or cy == 0 or cx == width - 1 or cy == height - 1:
-                    touches_border = True
-
-                min_x = min(min_x, cx)
-                max_x = max(max_x, cx)
-                min_y = min(min_y, cy)
-                max_y = max(max_y, cy)
-
-                for nx, ny in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
-                    if 0 <= nx < width and 0 <= ny < height:
-                        nidx = ny * width + nx
-                        if not visited[nidx]:
-                            visited[nidx] = 1
-                            if pixels[nx, ny] > 0:
-                                queue.append((nx, ny))
-
-            count = len(points)
-
-            if count < width * height * min_area_ratio:
-                continue
-
-            bbox = (min_x, min_y, max_x + 1, max_y + 1)
-            box_w = bbox[2] - bbox[0]
-            box_h = bbox[3] - bbox[1]
-
-            if box_w < width * 0.10 or box_h < height * 0.10:
-                continue
-
-            box_center_x = (bbox[0] + bbox[2]) / 2
-            box_center_y = (bbox[1] + bbox[3]) / 2
-            center_distance = abs(box_center_x - center_x) + abs(box_center_y - center_y)
-
-            score = float(count)
-
-            if touches_border:
-                score *= 0.15
-
-            score *= max(0.25, 1.0 - (center_distance / (width + height)))
-
-            if score > best_score:
-                component = Image.new("L", (width, height), 0)
-                component_pixels = component.load()
-
-                for pidx in points:
-                    py, px = divmod(pidx, width)
-                    component_pixels[px, py] = 255
-
-                best_score = score
-                best_bbox = bbox
-                best_region = component
-
-    return best_region, best_bbox
-
-
-def create_transparent_opening_mask(frame: Image.Image) -> Image.Image:
-    alpha = frame.convert("RGBA").getchannel("A")
-    return alpha.point(lambda a: 255 if a <= 35 else 0)
-
-
-def create_dark_opening_mask(frame: Image.Image) -> Image.Image:
-    img = frame.convert("RGBA")
-    width, height = img.size
-    pixels = img.load()
-
-    mask = Image.new("L", (width, height), 0)
-    mask_pixels = mask.load()
-
-    for y in range(height):
-        for x in range(width):
-            r, g, b, a = pixels[x, y]
-
-            if a < 20:
-                continue
-
-            lum = int(0.299 * r + 0.587 * g + 0.114 * b)
-
-            if lum <= 60 and max(r, g, b) - min(r, g, b) <= 45:
-                mask_pixels[x, y] = 255
-
-    return mask
+    return None, None
 
 
 def shrink_bbox(
@@ -402,20 +252,6 @@ def shrink_bbox(
     return left, top, right, bottom
 
 
-def apply_opening_mask_to_frame(
-    frame: Image.Image,
-    opening_mask: Image.Image,
-) -> Image.Image:
-    img = frame.convert("RGBA")
-    alpha = img.getchannel("A")
-    mask = opening_mask.convert("L")
-
-    new_alpha = ImageChops.subtract(alpha, mask)
-    img.putalpha(new_alpha)
-
-    return img
-
-
 def fallback_photo_area(frame_size: Tuple[int, int]) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
     width, height = frame_size
 
@@ -424,45 +260,71 @@ def fallback_photo_area(frame_size: Tuple[int, int]) -> Tuple[Image.Image, Tuple
     right = int(width * 0.88)
     bottom = int(height * 0.84)
 
-    mask = Image.new("L", (width, height), 0)
+    mask = Image.new("L", frame_size, 0)
     mask.paste(255, (left, top, right, bottom))
 
     return mask, (left, top, right, bottom)
 
 
-def load_and_prepare_frame(
-    frame_path: Path,
-) -> Tuple[Optional[Image.Image], Optional[Image.Image], Optional[Tuple[int, int, int, int]], Optional[str], bool]:
+def apply_opening_mask_to_frame(frame: Image.Image, opening_mask: Image.Image) -> Image.Image:
+    frame = frame.convert("RGBA")
+    opening_mask = opening_mask.convert("L").resize(frame.size, RESAMPLE_NEAREST)
+
+    alpha = frame.getchannel("A")
+    new_alpha = ImageChops.subtract(alpha, opening_mask)
+    frame.putalpha(new_alpha)
+
+    return frame
+
+
+@st.cache_data(show_spinner=False)
+def prepare_frame_cached(
+    frame_path_str: str,
+    frame_mtime: float,
+    frame_size_bytes: int,
+) -> Tuple[Optional[bytes], Optional[Tuple[int, int, int, int]], Optional[str], bool]:
     try:
-        with Image.open(frame_path) as raw_frame:
+        with Image.open(frame_path_str) as raw_frame:
             raw_frame.load()
             frame = raw_frame.convert("RGBA")
     except (UnidentifiedImageError, OSError, ValueError) as exc:
-        return None, None, None, f"Frame error: {exc}", False
+        return None, None, f"Frame error: {exc}", False
 
-    frame, checker_fixed = auto_make_checkerboard_transparent(frame)
+    original_size = frame.size
+    detection_frame, scale_x, scale_y = resize_for_detection(frame)
 
-    transparent_mask = create_transparent_opening_mask(frame)
-    opening_mask, bbox = find_best_opening_region(transparent_mask)
+    masks = [
+        create_transparent_opening_mask(detection_frame),
+        create_dark_opening_mask(detection_frame),
+        create_light_opening_mask(detection_frame),
+    ]
 
-    used_dark_placeholder = False
+    opening_mask_small = None
+    bbox_small = None
+    was_fixed = False
 
-    if opening_mask is None or bbox is None:
-        dark_mask = create_dark_opening_mask(frame)
-        opening_mask, bbox = find_best_opening_region(dark_mask)
-        used_dark_placeholder = opening_mask is not None and bbox is not None
+    for idx, mask in enumerate(masks):
+        opening_mask_small, bbox_small = find_best_opening_region(mask)
 
-    if opening_mask is None or bbox is None:
-        opening_mask, bbox = fallback_photo_area(frame.size)
+        if opening_mask_small is not None and bbox_small is not None:
+            was_fixed = idx != 0
+            break
 
-    bbox = shrink_bbox(bbox, 0.006, frame.size)
+    if opening_mask_small is None or bbox_small is None:
+        opening_mask, bbox = fallback_photo_area(original_size)
+    else:
+        opening_mask = opening_mask_small.resize(original_size, RESAMPLE_NEAREST)
+        bbox = scale_bbox_to_original(bbox_small, scale_x, scale_y, original_size)
+
+    bbox = shrink_bbox(bbox, 0.006, original_size)
     frame = apply_opening_mask_to_frame(frame, opening_mask)
 
-    was_fixed = checker_fixed or used_dark_placeholder
-
-    return frame, opening_mask, bbox, None, was_fixed
+    return image_to_png_bytes(frame), bbox, None, was_fixed
 
 
+# ------------------------------------------------------------
+# Student photo fitting
+# ------------------------------------------------------------
 def required_cover_scale(source_size: Tuple[int, int], target_size: Tuple[int, int]) -> float:
     source_w, source_h = source_size
     target_w, target_h = target_size
@@ -534,6 +396,7 @@ def auto_trim_photo_margins(image: Image.Image) -> Image.Image:
 
     if alpha_bbox:
         alpha_area = (alpha_bbox[2] - alpha_bbox[0]) * (alpha_bbox[3] - alpha_bbox[1])
+
         if alpha_area < width * height * 0.95:
             return crop_with_padding(img, alpha_bbox, 0.10, 0.10, 0.08)
 
@@ -576,11 +439,7 @@ def cover_crop_to_area(image: Image.Image, target_size: Tuple[int, int]) -> Imag
 
     left = (new_w - target_w) // 2
     extra_h = new_h - target_h
-
-    if extra_h > 0:
-        top = int(extra_h * 0.42)
-    else:
-        top = 0
+    top = int(extra_h * 0.42) if extra_h > 0 else 0
 
     return resized.crop((left, top, left + target_w, top + target_h))
 
@@ -610,10 +469,7 @@ def contain_fit_to_area(
     return area_canvas
 
 
-def smart_fit_photo_to_area(
-    image: Image.Image,
-    area_size: Tuple[int, int],
-) -> Image.Image:
+def smart_fit_photo_to_area(image: Image.Image, area_size: Tuple[int, int]) -> Image.Image:
     original_bg = estimate_photo_background_color(image)
     trimmed = auto_trim_photo_margins(image)
 
@@ -655,12 +511,12 @@ def apply_frame(student_background: Image.Image, frame: Image.Image) -> Image.Im
     if frame.mode != "RGBA":
         frame = frame.convert("RGBA")
 
-    if student_background.size != frame.size:
-        frame = frame.resize(student_background.size, RESAMPLE_LANCZOS)
-
     return Image.alpha_composite(student_background, frame)
 
 
+# ------------------------------------------------------------
+# Save/download helpers
+# ------------------------------------------------------------
 def rgba_to_rgb(
     image: Image.Image,
     background_color: Tuple[int, int, int] = (255, 255, 255),
@@ -729,29 +585,31 @@ def make_unique_output_name(
         counter += 1
 
     used_names.add(candidate.lower())
+
     return candidate
 
 
-def open_student_image(uploaded_file) -> Tuple[Optional[Image.Image], Optional[bytes], Optional[str]]:
+def open_student_image_from_bytes(
+    filename: str,
+    image_bytes: bytes,
+) -> Tuple[Optional[Image.Image], Optional[bytes], Optional[str]]:
     try:
-        uploaded_file.seek(0)
-
-        with Image.open(uploaded_file) as raw_image:
+        with Image.open(BytesIO(image_bytes)) as raw_image:
             raw_image.load()
             icc_profile = raw_image.info.get("icc_profile")
             image = correct_exif_orientation(raw_image).convert("RGBA")
             return image, icc_profile, None
 
     except (UnidentifiedImageError, OSError, ValueError):
-        return None, None, f"{uploaded_file.name} skipped. Invalid or corrupt image."
+        return None, None, f"{filename} skipped. Invalid or corrupt image."
 
 
-def make_preview_bytes(image: Image.Image, max_size: Tuple[int, int] = (650, 650)) -> bytes:
+def make_preview_bytes(image: Image.Image) -> bytes:
     preview = image.copy()
-    preview.thumbnail(max_size, RESAMPLE_LANCZOS)
+    preview.thumbnail(PREVIEW_MAX_SIZE, RESAMPLE_LANCZOS)
 
     buffer = BytesIO()
-    preview.save(buffer, format="PNG", optimize=True)
+    preview.save(buffer, format="JPEG", quality=82, optimize=True)
     buffer.seek(0)
 
     return buffer.getvalue()
@@ -765,62 +623,91 @@ def create_zip_from_results(results: List[Dict[str, object]]) -> bytes:
             zip_file.writestr(result["filename"], result["file_bytes"])
 
     zip_buffer.seek(0)
+
     return zip_buffer.getvalue()
 
 
 def get_mime_type(output_format: str) -> str:
-    if output_format.upper() == "JPG":
-        return "image/jpeg"
-    return "image/png"
+    return "image/jpeg" if output_format.upper() == "JPG" else "image/png"
 
 
-def process_uploaded_files(
+def process_single_image(
+    index: int,
+    filename: str,
+    image_bytes: bytes,
+    output_name: str,
+    frame_bytes: bytes,
+    photo_area_bbox: Tuple[int, int, int, int],
+    output_format: str,
+    jpg_quality: int,
+    mime_type: str,
+) -> Tuple[int, Optional[Dict[str, object]], List[str]]:
+    messages: List[str] = []
+
+    image, icc_profile, error = open_student_image_from_bytes(filename, image_bytes)
+
+    if error:
+        return index, None, [error]
+
+    if image is None:
+        return index, None, [f"{filename} skipped. Could not open image."]
+
+    frame = png_bytes_to_image(frame_bytes)
+
+    area_w = photo_area_bbox[2] - photo_area_bbox[0]
+    area_h = photo_area_bbox[3] - photo_area_bbox[1]
+
+    contain_scale = required_contain_scale(image.size, (area_w, area_h))
+
+    if contain_scale > 1.0:
+        messages.append(
+            f"{filename}: small image enlarged from "
+            f"{image.width}x{image.height}px to fit opening {area_w}x{area_h}px."
+        )
+
+    student_background = place_student_inside_frame_area(
+        student_image=image,
+        frame_size=frame.size,
+        photo_area_bbox=photo_area_bbox,
+    )
+
+    final_image = apply_frame(student_background, frame)
+
+    file_bytes = save_output_image_to_bytes(
+        image=final_image,
+        output_format=output_format,
+        jpg_quality=jpg_quality,
+        icc_profile=icc_profile,
+    )
+
+    preview_bytes = make_preview_bytes(final_image)
+
+    result = {
+        "filename": output_name,
+        "preview_bytes": preview_bytes,
+        "file_bytes": file_bytes,
+        "mime": mime_type,
+        "size": final_image.size,
+    }
+
+    return index, result, messages
+
+
+def process_uploaded_files_fast(
     uploaded_files,
-    frame: Image.Image,
+    frame_bytes: bytes,
     photo_area_bbox: Tuple[int, int, int, int],
     selected_frame_path: Path,
     output_format: str,
     jpg_quality: int,
 ) -> Tuple[List[Dict[str, object]], List[str], bytes]:
-    results: List[Dict[str, object]] = []
-    messages: List[str] = []
-
-    frame_size = frame.size
     used_names = set()
     mime_type = get_mime_type(output_format)
 
-    progress = st.progress(0)
+    payloads = []
 
-    area_w = photo_area_bbox[2] - photo_area_bbox[0]
-    area_h = photo_area_bbox[3] - photo_area_bbox[1]
-
-    for index, uploaded_file in enumerate(uploaded_files, start=1):
-        image, icc_profile, error = open_student_image(uploaded_file)
-
-        if error:
-            messages.append(error)
-            progress.progress(index / len(uploaded_files))
-            continue
-
-        if image is None:
-            progress.progress(index / len(uploaded_files))
-            continue
-
-        contain_scale = required_contain_scale(image.size, (area_w, area_h))
-
-        if contain_scale > 1.0:
-            messages.append(
-                f"{uploaded_file.name}: small image enlarged from "
-                f"{image.width}x{image.height}px to fit opening {area_w}x{area_h}px."
-            )
-
-        student_background = place_student_inside_frame_area(
-            student_image=image,
-            frame_size=frame_size,
-            photo_area_bbox=photo_area_bbox,
-        )
-
-        final_image = apply_frame(student_background, frame)
+    for index, uploaded_file in enumerate(uploaded_files):
+        file_bytes = uploaded_file.getvalue()
 
         output_name = make_unique_output_name(
             original_filename=uploaded_file.name,
@@ -829,32 +716,65 @@ def process_uploaded_files(
             used_names=used_names,
         )
 
-        file_bytes = save_output_image_to_bytes(
-            image=final_image,
-            output_format=output_format,
-            jpg_quality=jpg_quality,
-            icc_profile=icc_profile,
-        )
-
-        results.append(
+        payloads.append(
             {
-                "filename": output_name,
-                "preview_bytes": make_preview_bytes(final_image),
-                "file_bytes": file_bytes,
-                "mime": mime_type,
-                "size": final_image.size,
+                "index": index,
+                "filename": uploaded_file.name,
+                "image_bytes": file_bytes,
+                "output_name": output_name,
             }
         )
 
-        progress.progress(index / len(uploaded_files))
+    results_by_index: Dict[int, Dict[str, object]] = {}
+    all_messages: List[str] = []
+
+    progress = st.progress(0)
+    total = len(payloads)
+
+    max_workers = min(4, max(1, os.cpu_count() or 2), total)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(
+                process_single_image,
+                payload["index"],
+                payload["filename"],
+                payload["image_bytes"],
+                payload["output_name"],
+                frame_bytes,
+                photo_area_bbox,
+                output_format,
+                jpg_quality,
+                mime_type,
+            ): payload["index"]
+            for payload in payloads
+        }
+
+        completed = 0
+
+        for future in as_completed(future_map):
+            completed += 1
+
+            index, result, messages = future.result()
+
+            if result is not None:
+                results_by_index[index] = result
+
+            all_messages.extend(messages)
+
+            progress.progress(completed / total)
 
     progress.empty()
 
+    results = [results_by_index[i] for i in sorted(results_by_index.keys())]
     zip_bytes = create_zip_from_results(results)
 
-    return results, messages, zip_bytes
+    return results, all_messages, zip_bytes
 
 
+# ------------------------------------------------------------
+# UI
+# ------------------------------------------------------------
 def show_gallery(results: List[Dict[str, object]]) -> None:
     if not results:
         return
@@ -914,22 +834,28 @@ def main() -> None:
     selected_frame_name = st.selectbox("Frame", frame_names)
     selected_frame_path = FRAMES_DIR / selected_frame_name
 
-    frame_image, opening_mask, photo_area_bbox, frame_error, frame_was_fixed = load_and_prepare_frame(
-        selected_frame_path
+    stat = selected_frame_path.stat()
+
+    frame_bytes, photo_area_bbox, frame_error, frame_was_fixed = prepare_frame_cached(
+        str(selected_frame_path),
+        stat.st_mtime,
+        stat.st_size,
     )
 
-    if frame_image is None or opening_mask is None or photo_area_bbox is None:
+    if frame_bytes is None or photo_area_bbox is None:
         st.error(frame_error or "Could not load frame.")
         st.stop()
+
+    frame_preview = png_bytes_to_image(frame_bytes)
 
     col1, col2 = st.columns([1, 2])
 
     with col1:
-        st.image(frame_image, caption=selected_frame_name, use_container_width=True)
+        st.image(frame_preview, caption=selected_frame_name, use_container_width=True)
 
     with col2:
         uploaded_files = st.file_uploader(
-            "Sube tu fotos",
+            "Student photos",
             type=SUPPORTED_UPLOAD_TYPES,
             accept_multiple_files=True,
         )
@@ -938,7 +864,7 @@ def main() -> None:
             st.write(f"{len(uploaded_files)} image(s) selected")
 
         if frame_was_fixed:
-            st.success("Frame opening detected and fixed")
+            st.success("Frame opening detected")
 
         generate = st.button(
             "Generate",
@@ -948,9 +874,9 @@ def main() -> None:
         )
 
     if generate:
-        results, messages, zip_bytes = process_uploaded_files(
+        results, messages, zip_bytes = process_uploaded_files_fast(
             uploaded_files=uploaded_files,
-            frame=frame_image,
+            frame_bytes=frame_bytes,
             photo_area_bbox=photo_area_bbox,
             selected_frame_path=selected_frame_path,
             output_format=output_format,
