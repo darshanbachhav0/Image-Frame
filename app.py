@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
-from PIL import Image, ImageChops, ImageOps, ImageStat, UnidentifiedImageError
+from PIL import Image, ImageChops, ImageOps, UnidentifiedImageError
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -53,12 +53,6 @@ def load_frames(frames_dir: Path = FRAMES_DIR) -> Tuple[List[Path], Optional[str
 
 def correct_exif_orientation(image: Image.Image) -> Image.Image:
     return ImageOps.exif_transpose(image)
-
-
-def image_has_transparency(image: Image.Image) -> bool:
-    img = image.convert("RGBA")
-    alpha_min, alpha_max = img.getchannel("A").getextrema()
-    return alpha_min < 255 and alpha_max > 0
 
 
 def image_to_png_bytes(image: Image.Image) -> bytes:
@@ -111,7 +105,7 @@ def scale_bbox_to_original(
 
 
 # ------------------------------------------------------------
-# Fast frame opening detection
+# Frame opening detection
 # ------------------------------------------------------------
 def create_transparent_opening_mask(frame: Image.Image) -> Image.Image:
     alpha = frame.convert("RGBA").getchannel("A")
@@ -134,7 +128,7 @@ def create_light_opening_mask(frame: Image.Image) -> Image.Image:
     alpha = rgba.getchannel("A")
     hsv = rgba.convert("RGB").convert("HSV")
 
-    h, s, v = hsv.split()
+    _, s, v = hsv.split()
 
     low_saturation = s.point(lambda p: 255 if p <= 55 else 0)
     bright = v.point(lambda p: 255 if p >= 145 else 0)
@@ -608,6 +602,13 @@ def make_preview_bytes(image: Image.Image) -> bytes:
     preview = image.copy()
     preview.thumbnail(PREVIEW_MAX_SIZE, RESAMPLE_LANCZOS)
 
+    if preview.mode == "RGBA":
+        background = Image.new("RGB", preview.size, (255, 255, 255))
+        background.paste(preview, mask=preview.getchannel("A"))
+        preview = background
+    else:
+        preview = preview.convert("RGB")
+
     buffer = BytesIO()
     preview.save(buffer, format="JPEG", quality=82, optimize=True)
     buffer.seek(0)
@@ -755,7 +756,12 @@ def process_uploaded_files_fast(
         for future in as_completed(future_map):
             completed += 1
 
-            index, result, messages = future.result()
+            try:
+                index, result, messages = future.result()
+            except Exception as exc:
+                index = future_map[future]
+                result = None
+                messages = [f"Image {index + 1} skipped because of an error: {exc}"]
 
             if result is not None:
                 results_by_index[index] = result
