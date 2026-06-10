@@ -26,9 +26,6 @@ except AttributeError:
     RESAMPLE_NEAREST = Image.NEAREST
 
 
-# ------------------------------------------------------------
-# Basic helpers
-# ------------------------------------------------------------
 def sanitize_filename(name: str) -> str:
     name = Path(name).name
     name = re.sub(r"[^\w.\- ]+", "_", name, flags=re.UNICODE).strip()
@@ -104,9 +101,6 @@ def scale_bbox_to_original(
     return left, top, right, bottom
 
 
-# ------------------------------------------------------------
-# Frame opening detection
-# ------------------------------------------------------------
 def create_transparent_opening_mask(frame: Image.Image) -> Image.Image:
     alpha = frame.convert("RGBA").getchannel("A")
     return alpha.point(lambda a: 255 if a <= 35 else 0)
@@ -316,9 +310,6 @@ def prepare_frame_cached(
     return image_to_png_bytes(frame), bbox, None, was_fixed
 
 
-# ------------------------------------------------------------
-# Student photo fitting
-# ------------------------------------------------------------
 def required_cover_scale(source_size: Tuple[int, int], target_size: Tuple[int, int]) -> float:
     source_w, source_h = source_size
     target_w, target_h = target_size
@@ -508,9 +499,6 @@ def apply_frame(student_background: Image.Image, frame: Image.Image) -> Image.Im
     return Image.alpha_composite(student_background, frame)
 
 
-# ------------------------------------------------------------
-# Save/download helpers
-# ------------------------------------------------------------
 def rgba_to_rgb(
     image: Image.Image,
     background_color: Tuple[int, int, int] = (255, 255, 255),
@@ -778,9 +766,6 @@ def process_uploaded_files_fast(
     return results, all_messages, zip_bytes
 
 
-# ------------------------------------------------------------
-# UI
-# ------------------------------------------------------------
 def show_gallery(results: List[Dict[str, object]]) -> None:
     if not results:
         return
