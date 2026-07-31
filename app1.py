@@ -2149,9 +2149,7 @@ def show_completed_batch() -> None:
 
         st.caption(
             (
-                "The ZIP packages the generated JPG/PNG files "
-                "without recompressing them, so creating the "
-                "ZIP does not reduce image quality."
+               
             )
         )
 
@@ -2237,8 +2235,7 @@ def main() -> None:
 
             st.caption(
                 (
-                    "JPG uses the full frame resolution and "
-                    "4:4:4 chroma. Quality 100 creates larger files."
+                    
                 )
             )
 
