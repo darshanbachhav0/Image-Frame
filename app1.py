@@ -1,12 +1,44 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import gc
 import os
 import re
-import zipfile
+import shutil
+import tempfile
 import threading
+import time
+import uuid
+import zipfile
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 from PIL import Image, ImageChops, ImageFile, ImageOps, UnidentifiedImageError
@@ -23,8 +55,21 @@ SUPPORTED_UPLOAD_TYPES = ["jpg", "jpeg", "png", "webp"]
 DETECTION_MAX_SIZE = 850
 TRIM_DETECTION_MAX_SIZE = 900
 PREVIEW_MAX_SIZE = (420, 420)
-DEFAULT_PREVIEW_LIMIT = 24
-_THREAD_LOCAL = threading.local()
+DEFAULT_PREVIEW_LIMIT = 12
+MAX_PREVIEW_LIMIT = 24
+MAX_UPLOAD_FILES = 100
+DEFAULT_IMAGES_PER_ZIP = 10
+MAX_IMAGES_PER_ZIP = 25
+MAX_SOURCE_PIXELS = max(20_000_000, int(os.getenv("MAX_SOURCE_PIXELS", "80000000")))
+SOURCE_OVERSAMPLE = max(1.0, float(os.getenv("SOURCE_OVERSAMPLE", "2.0")))
+BATCH_RETENTION_SECONDS = max(3600, int(os.getenv("BATCH_RETENTION_SECONDS", "21600")))
+UPLOAD_COPY_CHUNK_SIZE = 1024 * 1024
+TEMP_ROOT = Path(os.getenv("APP_TEMP_DIR", tempfile.gettempdir())) / "graduation_frame_app"
+PROCESSING_LOCK = threading.Lock()
+
+# Pillow will still warn for very large images, while the app performs its own
+# explicit size validation before decoding them.
+Image.MAX_IMAGE_PIXELS = MAX_SOURCE_PIXELS
 
 try:
     RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
@@ -72,19 +117,6 @@ def png_bytes_to_image(data: bytes) -> Image.Image:
     img = Image.open(BytesIO(data))
     img.load()
     return img.convert("RGBA")
-
-
-def get_thread_cached_frame(frame_bytes: bytes) -> Image.Image:
-    """Decode the selected frame once per worker thread.
-
-    This avoids repeatedly opening the same PNG frame for every uploaded photo.
-    The returned image is used read-only by the worker.
-    """
-    frame_key = id(frame_bytes)
-    if getattr(_THREAD_LOCAL, "frame_key", None) != frame_key:
-        _THREAD_LOCAL.frame_key = frame_key
-        _THREAD_LOCAL.frame_image = png_bytes_to_image(frame_bytes)
-    return _THREAD_LOCAL.frame_image
 
 
 def resize_for_detection(image: Image.Image, max_size: int = DETECTION_MAX_SIZE) -> Tuple[Image.Image, float, float]:
@@ -290,6 +322,8 @@ def prepare_frame_cached(
     try:
         with Image.open(frame_path_str) as raw_frame:
             raw_frame.load()
+            # Keep the frame at its exact original resolution. The final image
+            # dimensions are therefore identical to the selected frame dimensions.
             frame = raw_frame.convert("RGBA")
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         return None, None, f"Frame error: {exc}", False
@@ -461,7 +495,7 @@ def detect_trim_bbox_fast(image: Image.Image) -> Optional[Tuple[int, int, int, i
 
 
 def auto_trim_photo_margins(image: Image.Image) -> Image.Image:
-    img = image.convert("RGBA")
+    img = image if image.mode == "RGBA" else image.convert("RGBA")
     width, height = img.size
 
     # Preserve the original high-quality alpha trimming behavior for transparent PNG/WebP files.
@@ -501,7 +535,9 @@ def cover_crop_to_area(image: Image.Image, target_size: Tuple[int, int]) -> Imag
     extra_h = new_h - target_h
     top = int(extra_h * 0.42) if extra_h > 0 else 0
 
-    return resized.crop((left, top, left + target_w, top + target_h))
+    cropped = resized.crop((left, top, left + target_w, top + target_h))
+    resized.close()
+    return cropped
 
 
 def contain_fit_to_area(
@@ -521,7 +557,11 @@ def contain_fit_to_area(
 
     paste_x = (target_w - new_w) // 2
     paste_y = (target_h - new_h) // 2
-    area_canvas.alpha_composite(resized.convert("RGBA"), (paste_x, paste_y))
+    resized_rgba = resized if resized.mode == "RGBA" else resized.convert("RGBA")
+    area_canvas.alpha_composite(resized_rgba, (paste_x, paste_y))
+    if resized_rgba is not resized:
+        resized_rgba.close()
+    resized.close()
 
     return area_canvas
 
@@ -529,7 +569,10 @@ def contain_fit_to_area(
 def smart_fit_photo_to_area(image: Image.Image, area_size: Tuple[int, int]) -> Image.Image:
     # Estimate background before trim, as in the original behavior.
     detection_for_bg, _, _ = resize_for_detection(image, TRIM_DETECTION_MAX_SIZE)
-    original_bg = estimate_photo_background_color(detection_for_bg)
+    try:
+        original_bg = estimate_photo_background_color(detection_for_bg)
+    finally:
+        detection_for_bg.close()
 
     trimmed = auto_trim_photo_margins(image)
     source_w, source_h = trimmed.size
@@ -563,10 +606,15 @@ def place_student_inside_frame_area(
 
 def apply_frame(student_background: Image.Image, frame: Image.Image) -> Image.Image:
     if student_background.mode != "RGBA":
-        student_background = student_background.convert("RGBA")
+        converted = student_background.convert("RGBA")
+        student_background.close()
+        student_background = converted
     if frame.mode != "RGBA":
         frame = frame.convert("RGBA")
-    return Image.alpha_composite(student_background, frame)
+
+    # Composite in-place to avoid allocating another full-frame RGBA image.
+    student_background.alpha_composite(frame)
+    return student_background
 
 
 def rgba_to_rgb(
@@ -581,75 +629,215 @@ def rgba_to_rgb(
     return background
 
 
+
 # -----------------------------
-# Saving, previews, ZIP
+# Saving, previews, temporary batches, ZIP parts
 # -----------------------------
 
-def save_output_image_to_bytes(
+def ensure_temp_root() -> Path:
+    TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+    return TEMP_ROOT
+
+
+def is_safe_batch_path(path: Path) -> bool:
+    try:
+        root = ensure_temp_root().resolve()
+        candidate = path.resolve()
+    except OSError:
+        return False
+    return candidate != root and root in candidate.parents
+
+
+def remove_batch_directory(path_value: object) -> None:
+    if not path_value:
+        return
+    try:
+        path = Path(str(path_value))
+        if is_safe_batch_path(path) and path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+    except (OSError, ValueError):
+        pass
+
+
+def cleanup_old_batches() -> None:
+    root = ensure_temp_root()
+    cutoff = time.time() - BATCH_RETENTION_SECONDS
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return
+
+    for child in children:
+        if not child.is_dir():
+            continue
+        try:
+            if child.stat().st_mtime < cutoff:
+                shutil.rmtree(child, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def clear_completed_batch() -> None:
+    completed = st.session_state.pop("completed_batch", None)
+    if isinstance(completed, dict):
+        remove_batch_directory(completed.get("batch_dir"))
+
+    for key in (
+        "batch_error",
+        "download_part_index",
+        "generation_notice",
+    ):
+        st.session_state.pop(key, None)
+    gc.collect()
+
+
+def clear_pending_batch() -> None:
+    pending = st.session_state.pop("pending_batch", None)
+    if isinstance(pending, dict):
+        remove_batch_directory(pending.get("batch_dir"))
+    gc.collect()
+
+
+def safe_staged_filename(index: int, original_name: str, used_names: set) -> str:
+    cleaned = sanitize_filename(Path(original_name).name)
+    candidate = f"{index + 1:03d}_{cleaned}"
+    stem = Path(candidate).stem
+    suffix = Path(candidate).suffix
+    counter = 1
+
+    while candidate.lower() in used_names:
+        candidate = f"{stem}_{counter}{suffix}"
+        counter += 1
+
+    used_names.add(candidate.lower())
+    return candidate
+
+
+def stage_uploaded_files(uploaded_files) -> Tuple[Path, List[Dict[str, object]], int]:
+    """Copy uploaded files to temporary disk, then let Streamlit clear the uploader."""
+    root = ensure_temp_root()
+    batch_id = f"batch_{int(time.time())}_{uuid.uuid4().hex[:10]}"
+    batch_dir = root / batch_id
+    input_dir = batch_dir / "inputs"
+    input_dir.mkdir(parents=True, exist_ok=False)
+
+    manifest: List[Dict[str, object]] = []
+    total_bytes = 0
+    used_names = set()
+
+    try:
+        for index, uploaded_file in enumerate(uploaded_files):
+            original_name = Path(uploaded_file.name).name
+            stored_name = safe_staged_filename(index, original_name, used_names)
+            destination = input_dir / stored_name
+
+            uploaded_file.seek(0)
+            with destination.open("wb") as output_file:
+                while True:
+                    chunk = uploaded_file.read(UPLOAD_COPY_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    output_file.write(chunk)
+                    total_bytes += len(chunk)
+
+            manifest.append(
+                {
+                    "original_name": original_name,
+                    "path": str(destination),
+                    "size": destination.stat().st_size,
+                }
+            )
+    except Exception:
+        shutil.rmtree(batch_dir, ignore_errors=True)
+        raise
+
+    return batch_dir, manifest, total_bytes
+
+
+def rgba_to_rgb_for_saving(
     image: Image.Image,
+    background_color: Tuple[int, int, int] = (255, 255, 255),
+) -> Image.Image:
+    if image.mode != "RGBA":
+        return image.convert("RGB")
+
+    background = Image.new("RGB", image.size, background_color)
+    background.paste(image, mask=image.getchannel("A"))
+    return background
+
+
+def save_output_image_to_path(
+    image: Image.Image,
+    output_path: Path,
     output_format: str,
     jpg_quality: int,
     icc_profile: Optional[bytes],
-) -> bytes:
-    buffer = BytesIO()
-    save_kwargs: Dict[str, object] = {}
+) -> None:
+    """Save at full frame resolution; PNG is lossless and JPG uses 4:4:4 chroma."""
 
-    if icc_profile:
-        save_kwargs["icc_profile"] = icc_profile
+    def save_once(include_icc: bool) -> None:
+        save_kwargs: Dict[str, object] = {}
+        if include_icc and icc_profile:
+            save_kwargs["icc_profile"] = icc_profile
 
-    if output_format.upper() == "PNG":
-        image.save(
-            buffer,
-            format="PNG",
-            compress_level=1,
-            optimize=False,
-            **save_kwargs,
-        )
-    else:
-        rgb_image = rgba_to_rgb(image)
-        # optimize=True is CPU-heavy on Render. Disabling it keeps visual quality the same.
-        rgb_image.save(
-            buffer,
-            format="JPEG",
-            quality=int(jpg_quality),
-            subsampling=0,
-            optimize=False,
-            progressive=False,
-            **save_kwargs,
-        )
+        if output_format.upper() == "PNG":
+            image.save(
+                output_path,
+                format="PNG",
+                compress_level=1,
+                optimize=False,
+                **save_kwargs,
+            )
+            return
 
-    return buffer.getvalue()
+        rgb_image = rgba_to_rgb_for_saving(image)
+        try:
+            rgb_image.save(
+                output_path,
+                format="JPEG",
+                quality=max(90, min(int(jpg_quality), 100)),
+                subsampling=0,
+                optimize=False,
+                progressive=False,
+                **save_kwargs,
+            )
+        finally:
+            rgb_image.close()
+
+    try:
+        save_once(include_icc=True)
+    except (OSError, ValueError):
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        save_once(include_icc=False)
 
 
 def make_preview_bytes(
     image: Image.Image,
     max_size: Tuple[int, int] = PREVIEW_MAX_SIZE,
-    quality: int = 82,
+    quality: int = 84,
 ) -> bytes:
     preview = image.copy()
-    preview.thumbnail(max_size, RESAMPLE_LANCZOS)
+    try:
+        preview.thumbnail(max_size, RESAMPLE_LANCZOS)
 
-    if preview.mode == "RGBA":
-        background = Image.new("RGB", preview.size, (255, 255, 255))
-        background.paste(preview, mask=preview.getchannel("A"))
-        preview = background
-    else:
-        preview = preview.convert("RGB")
+        if preview.mode == "RGBA":
+            background = Image.new("RGB", preview.size, (255, 255, 255))
+            background.paste(preview, mask=preview.getchannel("A"))
+            preview.close()
+            preview = background
+        else:
+            converted = preview.convert("RGB")
+            preview.close()
+            preview = converted
 
-    buffer = BytesIO()
-    preview.save(buffer, format="JPEG", quality=quality, optimize=False)
-    return buffer.getvalue()
-
-
-def create_zip_from_results(results: List[Dict[str, object]]) -> bytes:
-    zip_buffer = BytesIO()
-
-    # PNG/JPG are already compressed. ZIP_DEFLATED wastes CPU and slows Render a lot.
-    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_STORED) as zip_file:
-        for result in results:
-            zip_file.writestr(str(result["filename"]), result["file_bytes"])
-
-    return zip_buffer.getvalue()
+        buffer = BytesIO()
+        preview.save(buffer, format="JPEG", quality=quality, optimize=False)
+        return buffer.getvalue()
+    finally:
+        preview.close()
 
 
 def get_mime_type(output_format: str) -> str:
@@ -679,210 +867,416 @@ def make_unique_output_name(
     return candidate
 
 
-# -----------------------------
-# Per-image processing
-# -----------------------------
+def useful_decode_size(frame_size: Tuple[int, int]) -> Tuple[int, int]:
+    """Keep extra source detail before the final high-quality Lanczos resize."""
+    return (
+        max(1, int(round(frame_size[0] * SOURCE_OVERSAMPLE))),
+        max(1, int(round(frame_size[1] * SOURCE_OVERSAMPLE))),
+    )
 
-def open_student_image_from_bytes(
+
+def open_student_image_from_path(
     filename: str,
-    image_bytes: bytes,
+    image_path: Path,
+    frame_size: Tuple[int, int],
 ) -> Tuple[Optional[Image.Image], Optional[bytes], Optional[str]]:
     try:
-        with Image.open(BytesIO(image_bytes)) as raw_image:
-            raw_image.load()
+        with Image.open(image_path) as raw_image:
+            width, height = raw_image.size
+            if width <= 0 or height <= 0:
+                return None, None, f"{filename} skipped. Invalid image dimensions."
+
+            pixel_count = width * height
+            if pixel_count > MAX_SOURCE_PIXELS:
+                return (
+                    None,
+                    None,
+                    f"{filename} skipped. Image is {width}x{height}px "
+                    f"({pixel_count:,} pixels); maximum is {MAX_SOURCE_PIXELS:,} pixels.",
+                )
+
             icc_profile = raw_image.info.get("icc_profile")
-            image = correct_exif_orientation(raw_image).convert("RGBA")
+            decode_size = useful_decode_size(frame_size)
+
+            # JPEG draft decoding is used only when the source is much larger than
+            # the final frame. At least SOURCE_OVERSAMPLE times the output dimensions
+            # are retained before the final Lanczos resize.
+            if (
+                (raw_image.format or "").upper() in {"JPEG", "JPG"}
+                and width > decode_size[0] * 2
+                and height > decode_size[1] * 2
+            ):
+                try:
+                    raw_image.draft("RGB", decode_size)
+                except (OSError, ValueError):
+                    pass
+
+            oriented = correct_exif_orientation(raw_image)
+            try:
+                oriented.load()
+                oriented.thumbnail(decode_size, RESAMPLE_LANCZOS)
+                image = oriented.convert("RGBA")
+            finally:
+                if oriented is not raw_image:
+                    oriented.close()
+
             return image, icc_profile, None
-    except (UnidentifiedImageError, OSError, ValueError):
-        return None, None, f"{filename} skipped. Invalid or corrupt image."
+    except (
+        UnidentifiedImageError,
+        OSError,
+        ValueError,
+        Image.DecompressionBombError,
+    ):
+        return None, None, f"{filename} skipped. Invalid, corrupt, or oversized image."
 
 
-def process_single_image(
-    index: int,
+def process_single_image_to_file(
     filename: str,
-    image_bytes: bytes,
+    image_path: Path,
+    output_path: Path,
     output_name: str,
     frame_size: Tuple[int, int],
-    frame_bytes: bytes,
+    frame: Image.Image,
     photo_area_bbox: Tuple[int, int, int, int],
     output_format: str,
     jpg_quality: int,
-    mime_type: str,
     make_preview: bool,
-) -> Tuple[int, Optional[Dict[str, object]], List[str]]:
+) -> Tuple[Optional[Dict[str, object]], List[str]]:
     messages: List[str] = []
+    image: Optional[Image.Image] = None
+    final_image: Optional[Image.Image] = None
 
-    image, icc_profile, error = open_student_image_from_bytes(filename, image_bytes)
-    if error:
-        return index, None, [error]
-    if image is None:
-        return index, None, [f"{filename} skipped. Could not open image."]
-
-    area_w = photo_area_bbox[2] - photo_area_bbox[0]
-    area_h = photo_area_bbox[3] - photo_area_bbox[1]
-
-    contain_scale = required_contain_scale(image.size, (area_w, area_h))
-    if contain_scale > 1.0:
-        messages.append(
-            f"{filename}: small image enlarged from "
-            f"{image.width}x{image.height}px to fit opening {area_w}x{area_h}px."
+    try:
+        image, icc_profile, error = open_student_image_from_path(
+            filename=filename,
+            image_path=image_path,
+            frame_size=frame_size,
         )
+        if error:
+            return None, [error]
+        if image is None:
+            return None, [f"{filename} skipped. Could not open image."]
 
-    # Decode the selected frame only once per worker thread.
-    frame = get_thread_cached_frame(frame_bytes)
+        area_w = photo_area_bbox[2] - photo_area_bbox[0]
+        area_h = photo_area_bbox[3] - photo_area_bbox[1]
+        contain_scale = required_contain_scale(image.size, (area_w, area_h))
+        if contain_scale > 1.0:
+            messages.append(
+                f"{filename}: small image enlarged from "
+                f"{image.width}x{image.height}px to fit opening {area_w}x{area_h}px."
+            )
 
-    student_background = place_student_inside_frame_area(
-        student_image=image,
-        frame_size=frame_size,
-        photo_area_bbox=photo_area_bbox,
-    )
-    final_image = apply_frame(student_background, frame)
+        final_image = place_student_inside_frame_area(
+            student_image=image,
+            frame_size=frame_size,
+            photo_area_bbox=photo_area_bbox,
+        )
+        final_image = apply_frame(final_image, frame)
 
-    file_bytes = save_output_image_to_bytes(
-        image=final_image,
-        output_format=output_format,
-        jpg_quality=jpg_quality,
-        icc_profile=icc_profile,
-    )
-
-    preview_bytes = make_preview_bytes(final_image) if make_preview else None
-
-    result = {
-        "filename": output_name,
-        "preview_bytes": preview_bytes,
-        "file_bytes": file_bytes,
-        "mime": mime_type,
-        "size": final_image.size,
-    }
-
-    return index, result, messages
-
-
-def process_uploaded_files_fast(
-    uploaded_files,
-    frame_bytes: bytes,
-    photo_area_bbox: Tuple[int, int, int, int],
-    selected_frame_path: Path,
-    output_format: str,
-    jpg_quality: int,
-    preview_limit: int,
-) -> Tuple[List[Dict[str, object]], List[str], bytes]:
-    used_names = set()
-    mime_type = get_mime_type(output_format)
-    frame_size = png_bytes_to_image(frame_bytes).size
-
-    payloads = []
-    for index, uploaded_file in enumerate(uploaded_files):
-        file_bytes = uploaded_file.getvalue()
-        output_name = make_unique_output_name(
-            original_filename=uploaded_file.name,
-            frame_filename=selected_frame_path.name,
+        save_output_image_to_path(
+            image=final_image,
+            output_path=output_path,
             output_format=output_format,
-            used_names=used_names,
+            jpg_quality=jpg_quality,
+            icc_profile=icc_profile,
         )
-        payloads.append(
+
+        preview_bytes = make_preview_bytes(final_image) if make_preview else None
+        result = {
+            "filename": output_name,
+            "preview_bytes": preview_bytes,
+            "size": final_image.size,
+        }
+        return result, messages
+    finally:
+        if final_image is not None:
+            final_image.close()
+        if image is not None:
+            image.close()
+
+
+def process_staged_batch(pending: Dict[str, Any]) -> Dict[str, object]:
+    batch_dir = Path(str(pending["batch_dir"]))
+    files = list(pending["files"])
+    selected_frame_path = Path(str(pending["frame_path"]))
+    output_format = str(pending["output_format"])
+    jpg_quality = int(pending["jpg_quality"])
+    preview_limit = int(pending["preview_limit"])
+    images_per_zip = max(1, int(pending["images_per_zip"]))
+
+    if not is_safe_batch_path(batch_dir) or not batch_dir.exists():
+        raise RuntimeError("The temporary batch directory is missing.")
+
+    stat = selected_frame_path.stat()
+    frame_bytes, photo_area_bbox, frame_error, _ = prepare_frame_cached(
+        str(selected_frame_path),
+        stat.st_mtime,
+        stat.st_size,
+    )
+    if frame_bytes is None or photo_area_bbox is None:
+        raise RuntimeError(frame_error or "Could not load the selected frame.")
+
+    frame = png_bytes_to_image(frame_bytes)
+    frame_size = frame.size
+    downloads_dir = batch_dir / "downloads"
+    output_dir = batch_dir / "working"
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    used_names = set()
+    previews: List[Dict[str, object]] = []
+    messages: List[str] = []
+    zip_parts: List[Dict[str, object]] = []
+    generated_count = 0
+    total = len(files)
+    progress = st.progress(0)
+    status_text = st.empty()
+
+    current_zip: Optional[zipfile.ZipFile] = None
+    current_zip_path: Optional[Path] = None
+    current_part_number = 0
+    current_part_count = 0
+
+    def close_current_zip() -> None:
+        nonlocal current_zip, current_zip_path, current_part_count
+        if current_zip is None or current_zip_path is None:
+            return
+        current_zip.close()
+        zip_parts.append(
             {
-                "index": index,
-                "filename": uploaded_file.name,
-                "image_bytes": file_bytes,
-                "output_name": output_name,
-                "make_preview": index < preview_limit,
+                "part": current_part_number,
+                "path": str(current_zip_path),
+                "filename": current_zip_path.name,
+                "count": current_part_count,
+                "size": current_zip_path.stat().st_size,
             }
         )
+        current_zip = None
+        current_zip_path = None
+        current_part_count = 0
 
-    if not payloads:
-        return [], [], b""
+    try:
+        for index, item in enumerate(files):
+            original_name = str(item["original_name"])
+            source_path = Path(str(item["path"]))
+            status_text.write(f"Processing {index + 1} of {total}: {original_name}")
 
-    results_by_index: Dict[int, Dict[str, object]] = {}
-    all_messages: List[str] = []
+            output_name = make_unique_output_name(
+                original_filename=original_name,
+                frame_filename=selected_frame_path.name,
+                output_format=output_format,
+                used_names=used_names,
+            )
+            temporary_output = output_dir / output_name
 
-    progress = st.progress(0)
-    total = len(payloads)
-
-    # Render often has limited CPU/RAM. A small thread count is faster and safer than
-    # launching too many workers for large PIL images.
-    cpu_count = os.cpu_count() or 2
-    max_workers = min(total, max(2, cpu_count), 6)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(
-                process_single_image,
-                payload["index"],
-                payload["filename"],
-                payload["image_bytes"],
-                payload["output_name"],
-                frame_size,
-                frame_bytes,
-                photo_area_bbox,
-                output_format,
-                jpg_quality,
-                mime_type,
-                payload["make_preview"],
-            ): payload["index"]
-            for payload in payloads
-        }
-
-        completed = 0
-        for future in as_completed(future_map):
-            completed += 1
             try:
-                index, result, messages = future.result()
+                result, image_messages = process_single_image_to_file(
+                    filename=original_name,
+                    image_path=source_path,
+                    output_path=temporary_output,
+                    output_name=output_name,
+                    frame_size=frame_size,
+                    frame=frame,
+                    photo_area_bbox=photo_area_bbox,
+                    output_format=output_format,
+                    jpg_quality=jpg_quality,
+                    make_preview=generated_count < preview_limit,
+                )
             except Exception as exc:
-                index = future_map[future]
                 result = None
-                messages = [f"Image {index + 1} skipped because of an error: {exc}"]
+                image_messages = [f"{original_name} skipped because of an error: {exc}"]
 
-            if result is not None:
-                results_by_index[index] = result
-            all_messages.extend(messages)
-            progress.progress(completed / total)
+            messages.extend(image_messages)
 
-    progress.empty()
+            if result is not None and temporary_output.exists():
+                if current_zip is None or current_part_count >= images_per_zip:
+                    close_current_zip()
+                    current_part_number += 1
+                    current_zip_path = downloads_dir / (
+                        f"graduation_frames_part_{current_part_number:02d}.zip"
+                    )
+                    current_zip = zipfile.ZipFile(
+                        current_zip_path,
+                        mode="w",
+                        compression=zipfile.ZIP_STORED,
+                        allowZip64=True,
+                    )
 
-    results = [results_by_index[i] for i in sorted(results_by_index.keys())]
-    zip_bytes = create_zip_from_results(results)
-    return results, all_messages, zip_bytes
+                current_zip.write(temporary_output, arcname=output_name)
+                current_part_count += 1
+                generated_count += 1
+
+                if result.get("preview_bytes"):
+                    previews.append(result)
+
+            try:
+                temporary_output.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                source_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+            progress.progress((index + 1) / total)
+            if index % 2 == 1:
+                gc.collect()
+
+        close_current_zip()
+    finally:
+        if current_zip is not None:
+            current_zip.close()
+        frame.close()
+        progress.empty()
+        status_text.empty()
+        shutil.rmtree(output_dir, ignore_errors=True)
+        gc.collect()
+
+    return {
+        "batch_dir": str(batch_dir),
+        "batch_id": batch_dir.name,
+        "generated_count": generated_count,
+        "requested_count": total,
+        "messages": messages,
+        "previews": previews,
+        "preview_limit": preview_limit,
+        "zip_parts": zip_parts,
+        "output_format": output_format,
+        "frame_size": frame_size,
+    }
 
 
 # -----------------------------
 # Streamlit UI
 # -----------------------------
 
-def show_gallery(results: List[Dict[str, object]], preview_limit: int) -> None:
-    if not results or preview_limit <= 0:
-        return
+def human_size(size_bytes: int) -> str:
+    size = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size_bytes} B"
 
-    preview_results = [r for r in results[:preview_limit] if r.get("preview_bytes")]
-    if not preview_results:
+
+def show_gallery(results: List[Dict[str, object]]) -> None:
+    if not results:
         return
 
     st.subheader("Preview")
-    if len(results) > len(preview_results):
-        st.caption(
-            f"Showing first {len(preview_results)} preview(s) for speed. "
-            "The ZIP contains all generated images."
-        )
-
     columns_per_row = 4
-    for start in range(0, len(preview_results), columns_per_row):
+    for start in range(0, len(results), columns_per_row):
         cols = st.columns(columns_per_row)
-        for idx, (col, result) in enumerate(zip(cols, preview_results[start:start + columns_per_row])):
-            global_index = start + idx
+        for col, result in zip(cols, results[start:start + columns_per_row]):
             with col:
                 st.image(
                     result["preview_bytes"],
-                    caption=result["filename"],
+                    caption=str(result["filename"]),
                     use_container_width=True,
                 )
-                st.download_button(
-                    label="Download",
-                    data=result["file_bytes"],
-                    file_name=result["filename"],
-                    mime=result["mime"],
-                    key=f"download_single_{global_index}_{result['filename']}",
-                    use_container_width=True,
-                )
+
+
+def run_pending_batch() -> None:
+    pending = st.session_state.get("pending_batch")
+    if not isinstance(pending, dict):
+        return
+
+    st.subheader("Generating images")
+    st.caption(
+        "The upload widget has been cleared to release memory. "
+        "Photos are now processed one at a time at full frame resolution."
+    )
+
+    try:
+        wait_notice = st.empty()
+        if PROCESSING_LOCK.locked():
+            wait_notice.info("Another batch is being processed. This batch will start next.")
+        with PROCESSING_LOCK:
+            wait_notice.empty()
+            completed = process_staged_batch(pending)
+    except Exception as exc:
+        st.session_state["batch_error"] = f"Generation failed: {exc}"
+        remove_batch_directory(pending.get("batch_dir"))
+    else:
+        st.session_state["completed_batch"] = completed
+        st.session_state["generation_notice"] = (
+            f"Generated {completed['generated_count']} of "
+            f"{completed['requested_count']} image(s)."
+        )
+    finally:
+        st.session_state.pop("pending_batch", None)
+        gc.collect()
+
+    st.rerun()
+
+
+def show_completed_batch() -> None:
+    completed = st.session_state.get("completed_batch")
+    if not isinstance(completed, dict):
+        return
+
+    generated_count = int(completed.get("generated_count", 0))
+    requested_count = int(completed.get("requested_count", 0))
+    frame_size = completed.get("frame_size")
+
+    if generated_count:
+        st.success(f"Generated {generated_count} of {requested_count} image(s).")
+        if isinstance(frame_size, (tuple, list)) and len(frame_size) == 2:
+            st.caption(
+                f"Every output is {frame_size[0]} x {frame_size[1]} pixels, "
+                "the exact selected-frame resolution."
+            )
+    else:
+        st.error("No images were generated.")
+
+    messages = completed.get("messages") or []
+    if messages:
+        with st.expander(f"Warnings ({len(messages)})"):
+            for message in messages:
+                st.warning(str(message))
+
+    zip_parts = completed.get("zip_parts") or []
+    valid_parts = [part for part in zip_parts if Path(str(part.get("path", ""))).exists()]
+
+    if valid_parts:
+        st.subheader("Download")
+        labels = [
+            f"Part {part['part']} - {part['count']} image(s) - {human_size(int(part['size']))}"
+            for part in valid_parts
+        ]
+        selected_label = st.selectbox(
+            "Select a ZIP part",
+            labels,
+            key="download_part_index",
+        )
+        selected_index = labels.index(selected_label)
+        selected_part = valid_parts[selected_index]
+        selected_path = Path(str(selected_part["path"]))
+
+        # Only the selected ZIP part is registered with Streamlit, preventing all
+        # 100 outputs from being duplicated in server memory at once.
+        with selected_path.open("rb") as zip_file:
+            st.download_button(
+                label=f"Download {selected_part['filename']}",
+                data=zip_file,
+                file_name=str(selected_part["filename"]),
+                mime="application/zip",
+                key=f"download_{completed.get('batch_id')}_{selected_part['part']}",
+                use_container_width=True,
+            )
+
+        st.caption(
+            "Select and download each ZIP part. Splitting changes only the packaging; "
+            "it does not recompress or reduce the image quality."
+        )
+    elif generated_count:
+        st.error("The generated ZIP files are no longer available. Generate the batch again.")
+
+    show_gallery(list(completed.get("previews") or []))
+
+    if st.button("Clear generated batch", use_container_width=True):
+        clear_completed_batch()
+        st.rerun()
 
 
 def main() -> None:
@@ -892,22 +1286,50 @@ def main() -> None:
         layout="wide",
     )
 
+    cleanup_old_batches()
     st.title("🎓 Graduation Frame App")
 
+    if st.session_state.get("pending_batch"):
+        run_pending_batch()
+        return
+
+    if st.session_state.get("batch_error"):
+        st.error(st.session_state.pop("batch_error"))
+
+    if st.session_state.get("generation_notice"):
+        st.info(st.session_state.pop("generation_notice"))
+
     with st.sidebar:
-        output_format = st.radio("Format", ["PNG", "JPG"], index=0)
+        output_format = st.radio("Format", ["PNG", "JPG"], index=1)
 
         jpg_quality = 95
         if output_format == "JPG":
             jpg_quality = st.slider("JPG Quality", 90, 100, 95)
-            st.caption("JPG is usually much faster and smaller for photo outputs.")
+            st.caption(
+                "JPG uses full frame resolution and 4:4:4 chroma. "
+                "Quality 100 creates much larger files."
+            )
+        else:
+            st.caption("PNG output is lossless.")
 
         preview_limit = st.slider(
             "Preview limit",
             min_value=0,
-            max_value=100,
+            max_value=MAX_PREVIEW_LIMIT,
             value=DEFAULT_PREVIEW_LIMIT,
-            help="Lower preview count makes large batches much faster on Render. ZIP still includes every image.",
+            help="This affects only the on-screen previews, never the generated files.",
+        )
+
+        images_per_zip = st.slider(
+            "Images per ZIP part",
+            min_value=5,
+            max_value=MAX_IMAGES_PER_ZIP,
+            value=DEFAULT_IMAGES_PER_ZIP,
+            step=5,
+            help=(
+                "Smaller ZIP parts are safer on low-memory Render services. "
+                "ZIP splitting does not change image quality."
+            ),
         )
 
     frames, frame_error = load_frames(FRAMES_DIR)
@@ -935,63 +1357,72 @@ def main() -> None:
     with col1:
         frame_preview_bytes = make_frame_preview_cached(frame_bytes)
         st.image(frame_preview_bytes, caption=selected_frame_name, use_container_width=True)
+        with Image.open(selected_frame_path) as raw_frame:
+            st.caption(f"Output resolution: {raw_frame.width} x {raw_frame.height} pixels")
         if frame_was_fixed:
             st.success("Frame opening detected")
 
     with col2:
+        uploader_nonce = int(st.session_state.get("uploader_nonce", 0))
         uploaded_files = st.file_uploader(
-            "Student photos",
+            "Student photos (maximum 100)",
             type=SUPPORTED_UPLOAD_TYPES,
             accept_multiple_files=True,
+            key=f"student_photos_{uploader_nonce}",
         )
 
+        upload_error: Optional[str] = None
         if uploaded_files:
-            st.write(f"{len(uploaded_files)} image(s) selected")
+            total_upload_bytes = sum(
+                int(getattr(uploaded_file, "size", 0) or 0)
+                for uploaded_file in uploaded_files
+            )
+            st.write(
+                f"{len(uploaded_files)} image(s) selected "
+                f"({human_size(total_upload_bytes)} total)"
+            )
+            if len(uploaded_files) > MAX_UPLOAD_FILES:
+                upload_error = f"Select at most {MAX_UPLOAD_FILES} photos in one batch."
+
+        if upload_error:
+            st.error(upload_error)
 
         generate = st.button(
             "Generate",
             type="primary",
-            disabled=not uploaded_files,
+            disabled=not uploaded_files or upload_error is not None,
             use_container_width=True,
         )
 
     if generate:
-        with st.spinner("Generating images..."):
-            results, messages, zip_bytes = process_uploaded_files_fast(
-                uploaded_files=uploaded_files,
-                frame_bytes=frame_bytes,
-                photo_area_bbox=photo_area_bbox,
-                selected_frame_path=selected_frame_path,
-                output_format=output_format,
-                jpg_quality=jpg_quality,
-                preview_limit=preview_limit,
-            )
+        clear_pending_batch()
+        clear_completed_batch()
 
-        st.session_state["results"] = results
-        st.session_state["messages"] = messages
-        st.session_state["zip_bytes"] = zip_bytes
-        st.session_state["zip_filename"] = "graduation_frames.zip"
-        st.session_state["preview_limit"] = preview_limit
-
-        if results:
-            st.success(f"Generated {len(results)} image(s)")
+        try:
+            with st.spinner("Copying uploads to temporary disk..."):
+                batch_dir, manifest, total_bytes = stage_uploaded_files(uploaded_files)
+        except Exception as exc:
+            st.error(f"Could not stage the uploaded files: {exc}")
         else:
-            st.error("No images generated")
+            st.session_state["pending_batch"] = {
+                "batch_dir": str(batch_dir),
+                "files": manifest,
+                "total_upload_bytes": total_bytes,
+                "frame_path": str(selected_frame_path),
+                "output_format": output_format,
+                "jpg_quality": jpg_quality,
+                "preview_limit": preview_limit,
+                "images_per_zip": images_per_zip,
+            }
 
-    if st.session_state.get("messages"):
-        with st.expander("Warnings"):
-            for message in st.session_state["messages"]:
-                st.warning(message)
+            # Changing the uploader key clears all UploadedFile objects before the
+            # expensive image processing begins on the next Streamlit run.
+            st.session_state["uploader_nonce"] = uploader_nonce + 1
+            del uploaded_files
+            gc.collect()
+            st.rerun()
 
-    if st.session_state.get("results"):
-        st.download_button(
-            "Download ZIP",
-            data=st.session_state["zip_bytes"],
-            file_name=st.session_state["zip_filename"],
-            mime="application/zip",
-            use_container_width=True,
-        )
-        show_gallery(st.session_state["results"], st.session_state.get("preview_limit", DEFAULT_PREVIEW_LIMIT))
+    show_completed_batch()
 
 
 if __name__ == "__main__":
