@@ -1,0 +1,6 @@
+[server]
+maxUploadSize = 100
+maxMessageSize = 500
+enableXsrfProtection = true
+enableCORS = true
+headless = true
